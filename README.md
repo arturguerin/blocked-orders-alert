@@ -94,7 +94,7 @@ A lista é ordenada do mais antigo para o mais recente, máximo 10 pedidos visí
 
 | Propriedade         | Valor                                                      |
 |---------------------|------------------------------------------------------------|
-| `METABASE_URL`      | URL base do Metabase, sem barra final (ex: `https://metabase.gocase.com.br`) |
+| `METABASE_URL`      | URL base do Metabase, sem barra final                      |
 | `METABASE_API_KEY`  | A chave criada no passo 2                                  |
 | `WEBHOOK_URL`       | A URL do webhook do passo 1                                |
 | `QUESTION_ID`       | `26465` (ou o ID da question Metabase a monitorar)         |
