@@ -14,7 +14,7 @@ Todo dia útil às 7h da manhã (horário de Brasília), o script:
 
 1. Faz uma chamada autenticada na API do Metabase usando uma API key pessoal.
 2. Executa a question **#26465 — Pedidos Travados - Motivos E-commerce [EC]**.
-3. Se houver resultados, formata uma mensagem com indicador visual de urgência por idade e envia ao webhook do Google Chat.
+3. Se houver resultados, **agrupa os pedidos por urgência** (tempo de travamento) e envia uma mensagem formatada ao webhook do Google Chat.
 4. Se não houver resultados, **não envia nada** (sem spam — silêncio é uma feature).
 
 ### Por que essa arquitetura?
@@ -23,36 +23,43 @@ O ideal seria usar o canal nativo de webhooks do Metabase (`Admin → Notificaç
 
 ### Anatomia da mensagem
 
+Os pedidos são agrupados em até 5 buckets de urgência. Buckets vazios são omitidos. Cada bucket mostra até 5 pedidos (ajustável via `MAX_PER_BUCKET`), com overflow indicado por "_e mais X_".
+
 ```
 🚨 Pedidos travados — Motivos E-commerce
-3 pedidos hoje • 20/05
+13 pedidos hoje • 21/05
 
-🔴 GC123456 — travado há 2 dias
-   [EC] Cliente solicitou cancelamento parcial
-   📅 18/05 às 14:30
+🔴 Mais de 48h (2)
+   • GC123456 — [EC] Cancelamento parcial · 18/05 às 14:30
+   • GC789012 — [EC] Endereço incompleto · 19/05 às 09:15
 
-🟠 GC789012 — travado há 1 dia
-   [EC] Endereço de entrega incompleto
-   📅 19/05 às 09:15
+🟠 Entre 24h e 48h (3)
+   • GC345678 — [EC] Conflito de promoção · 19/05 às 20:55
+   • GC901234 — [EC] Pagamento pendente · 20/05 às 06:00
+   • GC567890 — [EC] Documentação faltando · 20/05 às 08:30
 
-🟡 GC345678 — travado há 12h
-   [EC] Conflito de promoção aplicada
-   📅 20/05 às 06:50
+🟢 Menos de 12h (8)
+   • GC111222 — [EC] Cancelamento parcial · 20/05 às 20:39
+   • GC333444 — [EC] Endereço incompleto · 20/05 às 20:40
+   • GC555666 — [EC] Cancelamento parcial · 20/05 às 20:41
+   • GC777888 — [EC] Conflito promoção · 20/05 às 20:43
+   • GC999000 — [EC] Endereço incompleto · 20/05 às 20:45
+   ... e mais 3
 
 🔗 Abrir lista completa no Metabase
 ```
 
-**Indicadores de urgência por idade:**
+**Buckets de urgência:**
 
-| Emoji | Critério         | Significado                |
-|-------|------------------|----------------------------|
-| 🔴    | +48h travado     | Crítico — agir imediato    |
-| 🟠    | 24–48h           | Alta prioridade            |
-| 🟡    | 12–24h           | Média prioridade           |
-| 🟢    | <12h             | Recém-travado              |
-| ⚪    | Sem data         | Travamento de data desconhecida |
+| Bucket          | Emoji | Critério         |
+|-----------------|-------|------------------|
+| Mais de 48h     | 🔴    | +48h travado     |
+| Entre 24h e 48h | 🟠    | 24h ≤ tempo < 48h |
+| Entre 12h e 24h | 🟡    | 12h ≤ tempo < 24h |
+| Menos de 12h    | 🟢    | <12h             |
+| Sem data        | ⚪    | Sem `locked_at` válido |
 
-A lista é ordenada do mais antigo para o mais recente, máximo 10 pedidos visíveis (excedentes aparecem como "_... e mais X pedidos_").
+Dentro de cada bucket, os pedidos são ordenados do mais antigo para o mais recente (priorizando os mais críticos no topo).
 
 ---
 
@@ -86,7 +93,7 @@ A lista é ordenada do mais antigo para o mais recente, máximo 10 pedidos visí
 1. Acesse [script.google.com](https://script.google.com) → **Novo projeto**.
 2. Renomeie o projeto (ex: `Alertas Pedidos Travados`).
 3. Apague o conteúdo padrão de `Código.gs` e cole o conteúdo de [`Codigo.gs`](./Codigo.gs) deste repositório.
-4. Salve (Ctrl/Cmd+S).
+4. Salve (**Ctrl/Cmd+S**) — sem isso a versão antiga continua rodando.
 
 ### 4. Configurar Script Properties (credenciais)
 
@@ -94,7 +101,7 @@ A lista é ordenada do mais antigo para o mais recente, máximo 10 pedidos visí
 
 | Propriedade         | Valor                                                      |
 |---------------------|------------------------------------------------------------|
-| `METABASE_URL`      | URL base do Metabase, sem barra final                      |
+| `METABASE_URL`      | URL base do Metabase, sem barra final (ex: `https://metabase.gocase.com.br`) |
 | `METABASE_API_KEY`  | A chave criada no passo 2                                  |
 | `WEBHOOK_URL`       | A URL do webhook do passo 1                                |
 | `QUESTION_ID`       | `26465` (ou o ID da question Metabase a monitorar)         |
@@ -115,7 +122,7 @@ A lista é ordenada do mais antigo para o mais recente, máximo 10 pedidos visí
 - **Tipo de acionador:** `Acionador diário`
 - **Hora do dia:** `7h às 8h`
 
-Salve. O Apps Script vai pedir autorização (Gmail-Send, UrlFetch) na primeira vez — aceite.
+Salve. O Apps Script vai pedir autorização (UrlFetch) na primeira vez — aceite.
 
 ### 7. Teste manual
 
@@ -137,6 +144,8 @@ No editor, com `notifyPedidosTravados` selecionado no dropdown → clique em **E
 
 Edite apenas a propriedade `QUESTION_ID` em **Script Properties**. Não precisa mexer no código.
 
+> ⚠️ Se a question nova tiver nomes de colunas diferentes da #26465, ajuste os candidatos de `getField()` no código (veja seção [Pedido aparece como `?`](#pedido-aparece-como--ou-motivodata-ausentes-na-mensagem) abaixo).
+
 ### Adicionar uma segunda question (ex: Motivos Ilustra #26468)
 
 Dois caminhos:
@@ -149,12 +158,12 @@ Dois caminhos:
 
 ### Mudar o formato da mensagem
 
-A montagem da mensagem está na seção `// 5. Montar mensagem` em `Codigo.gs`.
+A montagem da mensagem está na seção `// 6. Montar mensagem` em `Codigo.gs`.
 
-- **Limites de cor de urgência:** ajustar a função `ageEmoji()` (linhas com `if (h >= 48)` etc.).
-- **Formato de "há X tempo":** ajustar `relativeTime()`.
-- **Layout do bloco por pedido:** ajustar o `items.slice(0, MAX_SHOW).forEach(...)`.
-- **Limite de pedidos mostrados:** mudar a constante `MAX_SHOW`.
+- **Limites dos buckets de urgência:** ajustar a função `bucketOf()` (linhas com `if (h >= 48)` etc.).
+- **Labels e emojis dos buckets:** ajustar o array `BUCKETS` no topo da função.
+- **Pedidos visíveis por bucket:** mudar a constante `MAX_PER_BUCKET`.
+- **Layout da linha de cada pedido:** ajustar o `arr.slice(0, MAX_PER_BUCKET).forEach(...)`.
 
 ### Rotacionar credenciais
 
@@ -201,21 +210,38 @@ A montagem da mensagem está na seção `// 5. Montar mensagem` em `Codigo.gs`.
 | `Exception: Request failed for ...`               | URL do Metabase ou webhook errada           | Confira `METABASE_URL` (sem barra final) e `WEBHOOK_URL`                |
 | Webhook retorna não-200 (sem exception lançada)   | Webhook deletado, URL malformada            | Crie novo webhook no Chat e atualize `WEBHOOK_URL`                      |
 
-### Mensagem chega mas o layout está estranho
+### Pedido aparece como `?` ou motivo/data ausentes na mensagem
 
-O script procura colunas com nomes específicos no resultado da query (case-insensitive):
+O script procura colunas com nomes específicos no resultado da query, usando **normalização** (case-insensitive, sem acentos, sem caracteres especiais). Os candidatos testados são:
 
-- `REFERÊNCIA` / `REFERENCIA` / `reference`
-- `MOTIVO` / `locking_reason` / `translations`
-- `DATA DO TRAVAMENTO` / `locked_at`
-- `LINK DO PEDIDO` / `link`
+| Campo na mensagem | Nomes testados |
+|-------------------|----------------|
+| Referência        | `PEDIDO`, `REFERÊNCIA`, `REFERENCIA`, `reference`, `referencia`, `pedido`, `order`, `order_id`, `id` |
+| Motivo            | `MOTIVO DE TRAVAMENTO`, `MOTIVO`, `motivo`, `locking_reason`, `reason`, `translations` |
+| Data              | `DATA DO TRAVAMENTO`, `locked_at`, `data_travamento`, `data_do_travamento` |
+| Link              | `LINK DO PEDIDO`, `link`, `link_pedido`, `url` |
 
-Se nenhuma bater, o script **não cai num fallback** — vai mostrar `?` ou pular o campo. Para corrigir:
+Se nenhum candidato bater, o campo aparece como `?` (referência) ou some (motivo/data/link).
 
-- **Opção A:** renomeie as colunas no `SELECT` da question Metabase com aliases que batam (ex: `o.reference AS "REFERÊNCIA"`).
-- **Opção B:** adicione o nome real da coluna na chamada `getField(row, ...)` no código.
+**Como descobrir os nomes reais das colunas:** o script loga `Colunas disponíveis: [...]` e `Exemplo (primeira linha): {...}` a cada execução. Veja em **Execuções** ou **Registro de execução**.
 
-Você pode descobrir os nomes reais das colunas no log do Apps Script — o script loga `Colunas disponíveis: [...]` a cada execução.
+**Como corrigir:**
+
+- **Opção A (recomendada):** adicionar o nome real da coluna como mais um candidato nas chamadas `getField(row, ...)` dentro do `items.map(...)` no código.
+
+- **Opção B:** ajustar a query do Metabase pra usar aliases já reconhecidos (com aspas duplas pra preservar maiúsculas e acentos):
+  ```sql
+  SELECT
+    o.reference AS "PEDIDO",
+    lr.translations -> 'pt-BR' AS "MOTIVO DE TRAVAMENTO",
+    o.locked_at AS "DATA DO TRAVAMENTO",
+    'https://gocase.com.br/admin/orders/' || o.reference AS "LINK DO PEDIDO"
+  FROM ...
+  ```
+
+### "Ainda tá rodando a versão antiga" depois de colar código novo
+
+Confira que salvou com **Ctrl/Cmd+S** — o botão de "Executar" usa o último arquivo salvo, não o que tá visível no editor. O log do código novo (a partir de maio/2026) mostra `Colunas disponíveis:` e `Exemplo (primeira linha):` — se você só vê `Colunas:`, é versão antiga.
 
 ---
 

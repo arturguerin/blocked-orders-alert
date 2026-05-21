@@ -2,7 +2,7 @@
  * Alerta de Pedidos Travados → Google Chat
  *
  * Consulta uma question do Metabase via API e envia os resultados ao Google Chat
- * via webhook. Foco em pedidos travados, com indicador visual de urgência por idade.
+ * via webhook. Os pedidos são agrupados por urgência (tempo de travamento).
  *
  * Veja README.md para setup completo.
  *
@@ -30,7 +30,16 @@ function notifyPedidosTravados() {
   // Configurações visuais
   const TZ = 'America/Fortaleza';
   const TITLE = 'Pedidos travados — Motivos E-commerce';
-  const MAX_SHOW = 10;
+  const MAX_PER_BUCKET = 5;
+
+  // Definição dos buckets de urgência
+  const BUCKETS = [
+    { id: 'critical', label: 'Mais de 48h',     emoji: '🔴' },
+    { id: 'high',     label: 'Entre 24h e 48h', emoji: '🟠' },
+    { id: 'medium',   label: 'Entre 12h e 24h', emoji: '🟡' },
+    { id: 'low',      label: 'Menos de 12h',    emoji: '🟢' },
+    { id: 'unknown',  label: 'Sem data',        emoji: '⚪' }
+  ];
 
   // 1. Executar a question via API key do Metabase
   const queryRes = UrlFetchApp.fetch(
@@ -47,7 +56,10 @@ function notifyPedidosTravados() {
 
   const rows = JSON.parse(queryRes.getContentText());
   Logger.log(`Question #${QUESTION_ID} retornou ${rows.length} linha(s)`);
-  if (rows.length > 0) Logger.log('Colunas disponíveis: ' + JSON.stringify(Object.keys(rows[0])));
+  if (rows.length > 0) {
+    Logger.log('Colunas disponíveis: ' + JSON.stringify(Object.keys(rows[0])));
+    Logger.log('Exemplo (primeira linha): ' + JSON.stringify(rows[0]));
+  }
 
   // 2. Sem resultados → sem notificação (silêncio é uma feature)
   if (rows.length === 0) {
@@ -57,83 +69,114 @@ function notifyPedidosTravados() {
 
   // 3. Helpers ============================================================
 
-  /** Busca uma coluna no row testando vários nomes (case-insensitive). */
+  /**
+   * Normaliza nome de coluna: minúsculas, sem acentos, sem caracteres especiais.
+   * "REFERÊNCIA" → "referencia"
+   * "MOTIVO DE TRAVAMENTO" → "motivodetravamento"
+   * "Data do Travamento" → "datadotravamento"
+   * "locked_at" → "lockedat"
+   */
+  function normalize(s) {
+    return String(s).toLowerCase()
+      .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+      .replace(/[^a-z0-9]/g, '');
+  }
+
+  /**
+   * Busca uma coluna no row testando vários nomes candidatos.
+   * A normalização permite matchar variações de caixa, acentos, espaços, etc.
+   */
   function getField(row, ...candidates) {
+    const normalizedKeys = Object.keys(row).map(k => ({ orig: k, norm: normalize(k) }));
     for (const c of candidates) {
-      const key = Object.keys(row).find(k => k.toLowerCase() === c.toLowerCase());
-      if (key && row[key] != null) return row[key];
+      const cNorm = normalize(c);
+      const match = normalizedKeys.find(({ norm }) => norm === cNorm);
+      if (match && row[match.orig] != null) return row[match.orig];
     }
     return null;
   }
 
-  /** Converte um valor (string ISO ou null) em Date ou null se inválido. */
   function parseDate(v) {
     if (!v) return null;
     const d = new Date(v);
     return isNaN(d.getTime()) ? null : d;
   }
 
-  /** Retorna emoji de urgência baseado em horas decorridas. */
-  function ageEmoji(h) {
-    if (h == null) return '⚪';
-    if (h >= 48) return '🔴'; // mais de 2 dias
-    if (h >= 24) return '🟠'; // 1 a 2 dias
-    if (h >= 12) return '🟡'; // 12 a 24h
-    return '🟢';              // menos de 12h
+  function bucketOf(h) {
+    if (h == null) return 'unknown';
+    if (h >= 48) return 'critical';
+    if (h >= 24) return 'high';
+    if (h >= 12) return 'medium';
+    return 'low';
   }
 
-  /** Formata "há X tempo" em português. */
-  function relativeTime(h) {
-    if (h == null) return 'tempo desconhecido';
-    if (h < 1) return `há ${Math.max(1, Math.round(h * 60))} min`;
-    if (h < 24) return `há ${Math.round(h)}h`;
-    const d = Math.floor(h / 24);
-    return d === 1 ? 'há 1 dia' : `há ${d} dias`;
-  }
-
-  /** Formata Date no padrão "dd/MM às HH:mm" no fuso configurado. */
   function formatDate(d) {
     return d ? Utilities.formatDate(d, TZ, "dd/MM 'às' HH:mm") : '';
   }
 
-  // 4. Normalizar + enriquecer + ordenar (mais antigos primeiro) =========
+  // 4. Normalizar + enriquecer cada linha =================================
   const now = new Date();
   const items = rows.map(row => {
-    const lockedAt = parseDate(getField(row, 'DATA DO TRAVAMENTO', 'locked_at'));
+    const lockedAt = parseDate(getField(row,
+      'DATA DO TRAVAMENTO', 'locked_at', 'data_travamento', 'data_do_travamento'
+    ));
     return {
-      ref:      getField(row, 'REFERÊNCIA', 'REFERENCIA', 'reference'),
-      motivo:   getField(row, 'MOTIVO', 'locking_reason', 'translations'),
-      link:     getField(row, 'LINK DO PEDIDO', 'link'),
+      ref: getField(row,
+        'PEDIDO', 'REFERÊNCIA', 'REFERENCIA', 'reference', 'referencia',
+        'pedido', 'order', 'order_id', 'id'
+      ),
+      motivo: getField(row,
+        'MOTIVO DE TRAVAMENTO', 'MOTIVO', 'motivo',
+        'locking_reason', 'reason', 'translations'
+      ),
+      link: getField(row,
+        'LINK DO PEDIDO', 'link', 'link_pedido', 'url'
+      ),
       lockedAt: lockedAt,
       hoursAgo: lockedAt ? (now - lockedAt) / 3600000 : null
     };
   });
 
-  // Ordena do mais antigo (urgente) pro mais novo
-  items.sort((a, b) => (b.hoursAgo ?? -1) - (a.hoursAgo ?? -1));
+  // 5. Agrupar por bucket e ordenar (mais antigo primeiro dentro do bucket)
+  const grouped = {};
+  items.forEach(p => {
+    const b = bucketOf(p.hoursAgo);
+    (grouped[b] = grouped[b] || []).push(p);
+  });
+  Object.values(grouped).forEach(arr =>
+    arr.sort((a, b) => (b.hoursAgo ?? -1) - (a.hoursAgo ?? -1))
+  );
 
-  // 5. Montar mensagem ====================================================
+  // 6. Montar mensagem ====================================================
   const total = items.length;
   const todayStr = Utilities.formatDate(now, TZ, 'dd/MM');
+
   let message = `🚨 *${TITLE}*\n`;
   message += `_${total} pedido${total === 1 ? '' : 's'} hoje • ${todayStr}_\n\n`;
 
-  items.slice(0, MAX_SHOW).forEach(p => {
-    const refDisp = p.link && p.ref ? `<${p.link}|${p.ref}>` : (p.ref || '?');
-    message += `${ageEmoji(p.hoursAgo)} ${refDisp} — travado *${relativeTime(p.hoursAgo)}*\n`;
-    if (p.motivo)   message += `   ${p.motivo}\n`;
-    if (p.lockedAt) message += `   📅 ${formatDate(p.lockedAt)}\n`;
-    message += '\n';
-  });
+  for (const bucket of BUCKETS) {
+    const arr = grouped[bucket.id] || [];
+    if (arr.length === 0) continue;
 
-  if (total > MAX_SHOW) {
-    const rest = total - MAX_SHOW;
-    message += `_... e mais ${rest} pedido${rest === 1 ? '' : 's'}._\n\n`;
+    message += `${bucket.emoji} *${bucket.label}* (${arr.length})\n`;
+
+    arr.slice(0, MAX_PER_BUCKET).forEach(p => {
+      const refDisp = p.link && p.ref ? `<${p.link}|${p.ref}>` : (p.ref || '?');
+      const motivoStr = p.motivo ? ` — ${p.motivo}` : '';
+      const dateStr = p.lockedAt ? ` · ${formatDate(p.lockedAt)}` : '';
+      message += `   • ${refDisp}${motivoStr}${dateStr}\n`;
+    });
+
+    if (arr.length > MAX_PER_BUCKET) {
+      const rest = arr.length - MAX_PER_BUCKET;
+      message += `   _... e mais ${rest}_\n`;
+    }
+    message += '\n';
   }
 
   message += `🔗 <${METABASE_URL}/question/${QUESTION_ID}|Abrir lista completa no Metabase>`;
 
-  // 6. Enviar pro webhook do Google Chat =================================
+  // 7. Enviar pro webhook do Google Chat ==================================
   const chatRes = UrlFetchApp.fetch(WEBHOOK_URL, {
     method: 'post',
     contentType: 'application/json',
