@@ -2,187 +2,364 @@
  * Alerta de Pedidos Travados → Google Chat
  *
  * Consulta uma question do Metabase via API e envia os resultados ao Google Chat
- * via webhook. Os pedidos são agrupados por urgência (tempo de travamento).
+ * via webhook, agrupados por motivo e por urgência (tempo de travamento).
  *
- * Veja README.md para setup completo.
+ * Se qualquer etapa falhar (permissão, API key, Metabase fora do ar, webhook),
+ * uma mensagem de falha é postada no mesmo espaço do Chat. No primeiro dia
+ * em que voltar a funcionar, a mensagem avisa que o alerta foi normalizado.
  *
- * Configuração: ⚙️ Configurações do projeto → Propriedades do script
- * Propriedades necessárias:
+ * Script Properties necessárias (⚙️ Configurações do projeto → Propriedades do script):
  *   - METABASE_URL:      URL base do Metabase (sem barra final)
- *   - METABASE_API_KEY:  API key pessoal criada no Metabase
+ *   - METABASE_API_KEY:  API key gerada em metabase-keygen.devgogroup.com
  *   - WEBHOOK_URL:       URL do webhook do Google Chat
  *   - QUESTION_ID:       ID da question Metabase a monitorar
  *
- * Acionador recomendado: diário, das 7h às 8h, fuso America/Fortaleza.
+ * Property gerenciada pelo próprio script (não precisa criar):
+ *   - CONSECUTIVE_FAILURES: contador de falhas seguidas
+ *
+ * IMPORTANTE: a question precisa estar numa coleção legível pelo grupo das
+ * API keys do keygen (ex.: "Ecommerce"). Nunca na raiz "Nossas análises"
+ * nem em coleção pessoal.
+ *
+ * Setup: rode setupTrigger() uma vez. Para testar o aviso de falha, rode
+ * testarAvisoDeFalha().
  */
 
-function notifyPedidosTravados() {
-  const props = PropertiesService.getScriptProperties();
-  const METABASE_URL = (props.getProperty('METABASE_URL') || '').replace(/\/$/, '');
-  const API_KEY = props.getProperty('METABASE_API_KEY');
-  const WEBHOOK_URL = props.getProperty('WEBHOOK_URL');
-  const QUESTION_ID = props.getProperty('QUESTION_ID');
-
-  if (!METABASE_URL || !API_KEY || !WEBHOOK_URL || !QUESTION_ID) {
-    throw new Error('Faltam Script Properties. Veja README.md para configuração.');
-  }
-
-  // Configurações visuais
-  const TZ = 'America/Fortaleza';
-  const TITLE = 'Pedidos travados — Motivos E-commerce';
-  const MAX_PER_BUCKET = 5;
-
-  // Definição dos buckets de urgência
-  const BUCKETS = [
+const CONFIG = {
+  TZ: 'America/Fortaleza',
+  TITLE: 'Pedidos travados — Motivos E-commerce',
+  TRIGGER_FUNCTION: 'notifyPedidosTravados',
+  TRIGGER_HOUR: 6,
+  MAX_PER_BUCKET: 5,
+  MAX_MOTIVOS: 10,
+  BUCKETS: [
     { id: 'critical', label: 'Mais de 48h',     emoji: '🔴' },
     { id: 'high',     label: 'Entre 24h e 48h', emoji: '🟠' },
     { id: 'medium',   label: 'Entre 12h e 24h', emoji: '🟡' },
     { id: 'low',      label: 'Menos de 12h',    emoji: '🟢' },
     { id: 'unknown',  label: 'Sem data',        emoji: '⚪' }
-  ];
+  ]
+};
+
+// ============================================================================
+// Ponto de entrada (é esta função que o acionador chama)
+// ============================================================================
+
+function notifyPedidosTravados() {
+  const props = PropertiesService.getScriptProperties();
+  const prevFailures = Number(props.getProperty('CONSECUTIVE_FAILURES') || 0);
+
+  try {
+    runAlert_(prevFailures);
+    props.setProperty('CONSECUTIVE_FAILURES', '0');
+  } catch (e) {
+    const failures = prevFailures + 1;
+    props.setProperty('CONSECUTIVE_FAILURES', String(failures));
+    notifyFailure_(e, failures);
+    throw e; // mantém a execução marcada como "Falha" no painel Execuções
+  }
+}
+
+// ============================================================================
+// Lógica principal do alerta
+// ============================================================================
+
+function runAlert_(prevFailures) {
+  const cfg = getConfig_();
 
   // 1. Executar a question via API key do Metabase
   const queryRes = UrlFetchApp.fetch(
-    `${METABASE_URL}/api/card/${QUESTION_ID}/query/json`,
+    `${cfg.METABASE_URL}/api/card/${cfg.QUESTION_ID}/query/json`,
     {
       method: 'post',
-      headers: { 'X-API-Key': API_KEY },
+      headers: { 'X-API-Key': cfg.API_KEY },
       muteHttpExceptions: true
     }
   );
-  if (queryRes.getResponseCode() !== 200) {
-    throw new Error(`Query falhou (${queryRes.getResponseCode()}): ${queryRes.getContentText()}`);
+  const code = queryRes.getResponseCode();
+  if (code !== 200) {
+    throw alertError_('metabase', code,
+      `Query falhou (${code}): ${queryRes.getContentText().slice(0, 300)}`);
   }
 
-  const rows = JSON.parse(queryRes.getContentText());
-  Logger.log(`Question #${QUESTION_ID} retornou ${rows.length} linha(s)`);
+  let rows;
+  try {
+    rows = JSON.parse(queryRes.getContentText());
+  } catch (err) {
+    throw alertError_('metabase', code, 'Resposta do Metabase não é JSON válido.');
+  }
+  if (!Array.isArray(rows)) {
+    // O Metabase às vezes responde 200 com um objeto de erro em vez da lista
+    const detail = rows && rows.error ? rows.error : JSON.stringify(rows).slice(0, 300);
+    throw alertError_('metabase', code, `Resposta inesperada do Metabase: ${detail}`);
+  }
+
+  Logger.log(`Question #${cfg.QUESTION_ID} retornou ${rows.length} linha(s)`);
   if (rows.length > 0) {
     Logger.log('Colunas disponíveis: ' + JSON.stringify(Object.keys(rows[0])));
-    Logger.log('Exemplo (primeira linha): ' + JSON.stringify(rows[0]));
   }
 
-  // 2. Sem resultados → sem notificação (silêncio é uma feature)
+  const recoveryNote = prevFailures > 0
+    ? `✅ _Alerta normalizado após ${prevFailures} falha${prevFailures === 1 ? '' : 's'} seguida${prevFailures === 1 ? '' : 's'}._\n\n`
+    : '';
+
+  // 2. Sem resultados → silêncio, exceto se estiver voltando de falha
   if (rows.length === 0) {
-    Logger.log('Sem pedidos travados. Sem notificação.');
+    Logger.log('Sem pedidos travados.');
+    if (recoveryNote) {
+      postToChat_(cfg.WEBHOOK_URL,
+        `${recoveryNote}Sem pedidos travados hoje. O silêncio nos próximos dias volta a significar "nada travado".`);
+    }
     return;
   }
 
-  // 3. Helpers ============================================================
+  // 3. Montar e enviar a mensagem
+  const message = recoveryNote + buildMessage_(rows, cfg);
+  postToChat_(cfg.WEBHOOK_URL, message);
+  Logger.log('Mensagem enviada ao Chat.');
+}
 
-  /**
-   * Normaliza nome de coluna: minúsculas, sem acentos, sem caracteres especiais.
-   * "REFERÊNCIA" → "referencia"
-   * "MOTIVO DE TRAVAMENTO" → "motivodetravamento"
-   * "Data do Travamento" → "datadotravamento"
-   * "locked_at" → "lockedat"
-   */
-  function normalize(s) {
-    return String(s).toLowerCase()
-      .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
-      .replace(/[^a-z0-9]/g, '');
-  }
+// ============================================================================
+// Montagem da mensagem
+// ============================================================================
 
-  /**
-   * Busca uma coluna no row testando vários nomes candidatos.
-   * A normalização permite matchar variações de caixa, acentos, espaços, etc.
-   */
-  function getField(row, ...candidates) {
-    const normalizedKeys = Object.keys(row).map(k => ({ orig: k, norm: normalize(k) }));
-    for (const c of candidates) {
-      const cNorm = normalize(c);
-      const match = normalizedKeys.find(({ norm }) => norm === cNorm);
-      if (match && row[match.orig] != null) return row[match.orig];
-    }
-    return null;
-  }
-
-  function parseDate(v) {
-    if (!v) return null;
-    const d = new Date(v);
-    return isNaN(d.getTime()) ? null : d;
-  }
-
-  function bucketOf(h) {
-    if (h == null) return 'unknown';
-    if (h >= 48) return 'critical';
-    if (h >= 24) return 'high';
-    if (h >= 12) return 'medium';
-    return 'low';
-  }
-
-  function formatDate(d) {
-    return d ? Utilities.formatDate(d, TZ, "dd/MM 'às' HH:mm") : '';
-  }
-
-  // 4. Normalizar + enriquecer cada linha =================================
+function buildMessage_(rows, cfg) {
   const now = new Date();
+
   const items = rows.map(row => {
-    const lockedAt = parseDate(getField(row,
+    const lockedAt = parseDate_(getField_(row,
       'DATA DO TRAVAMENTO', 'locked_at', 'data_travamento', 'data_do_travamento'
     ));
     return {
-      ref: getField(row,
+      ref: getField_(row,
         'PEDIDO', 'REFERÊNCIA', 'REFERENCIA', 'reference', 'referencia',
         'pedido', 'order', 'order_id', 'id'
       ),
-      motivo: getField(row,
+      motivo: getField_(row,
         'MOTIVO DE TRAVAMENTO', 'MOTIVO', 'motivo',
         'locking_reason', 'reason', 'translations'
       ),
-      link: getField(row,
-        'LINK DO PEDIDO', 'link', 'link_pedido', 'url'
-      ),
+      link: getField_(row, 'LINK DO PEDIDO', 'link', 'link_pedido', 'url'),
       lockedAt: lockedAt,
       hoursAgo: lockedAt ? (now - lockedAt) / 3600000 : null
     };
   });
 
-  // 5. Agrupar por bucket e ordenar (mais antigo primeiro dentro do bucket)
+  const total = items.length;
+  const todayStr = Utilities.formatDate(now, CONFIG.TZ, 'dd/MM');
+
+  let message = `🚨 *${CONFIG.TITLE}*\n`;
+  message += `_${total} pedido${total === 1 ? '' : 's'} hoje • ${todayStr}_\n\n`;
+
+  // Resumo por motivo (mais frequente primeiro)
+  const byMotivo = {};
+  items.forEach(p => {
+    const m = p.motivo || 'Sem motivo';
+    byMotivo[m] = (byMotivo[m] || 0) + 1;
+  });
+  const motivos = Object.entries(byMotivo).sort((a, b) => b[1] - a[1]);
+
+  message += `📊 *Por motivo:*\n`;
+  motivos.slice(0, CONFIG.MAX_MOTIVOS).forEach(([m, n]) => {
+    message += `   • ${m}: *${n}*\n`;
+  });
+  if (motivos.length > CONFIG.MAX_MOTIVOS) {
+    message += `   _... e mais ${motivos.length - CONFIG.MAX_MOTIVOS} motivo(s)_\n`;
+  }
+  message += '\n';
+
+  // Agrupar por bucket de urgência (mais antigo primeiro)
   const grouped = {};
   items.forEach(p => {
-    const b = bucketOf(p.hoursAgo);
+    const b = bucketOf_(p.hoursAgo);
     (grouped[b] = grouped[b] || []).push(p);
   });
   Object.values(grouped).forEach(arr =>
     arr.sort((a, b) => (b.hoursAgo ?? -1) - (a.hoursAgo ?? -1))
   );
 
-  // 6. Montar mensagem ====================================================
-  const total = items.length;
-  const todayStr = Utilities.formatDate(now, TZ, 'dd/MM');
-
-  let message = `🚨 *${TITLE}*\n`;
-  message += `_${total} pedido${total === 1 ? '' : 's'} hoje • ${todayStr}_\n\n`;
-
-  for (const bucket of BUCKETS) {
+  for (const bucket of CONFIG.BUCKETS) {
     const arr = grouped[bucket.id] || [];
     if (arr.length === 0) continue;
 
     message += `${bucket.emoji} *${bucket.label}* (${arr.length})\n`;
-
-    arr.slice(0, MAX_PER_BUCKET).forEach(p => {
+    arr.slice(0, CONFIG.MAX_PER_BUCKET).forEach(p => {
       const refDisp = p.link && p.ref ? `<${p.link}|${p.ref}>` : (p.ref || '?');
       const motivoStr = p.motivo ? ` — ${p.motivo}` : '';
-      const dateStr = p.lockedAt ? ` · ${formatDate(p.lockedAt)}` : '';
+      const dateStr = p.lockedAt ? ` · ${formatDate_(p.lockedAt)}` : '';
       message += `   • ${refDisp}${motivoStr}${dateStr}\n`;
     });
-
-    if (arr.length > MAX_PER_BUCKET) {
-      const rest = arr.length - MAX_PER_BUCKET;
-      message += `   _... e mais ${rest}_\n`;
+    if (arr.length > CONFIG.MAX_PER_BUCKET) {
+      message += `   _... e mais ${arr.length - CONFIG.MAX_PER_BUCKET}_\n`;
     }
     message += '\n';
   }
 
-  message += `🔗 <${METABASE_URL}/question/${QUESTION_ID}|Abrir lista completa no Metabase>`;
+  message += `🔗 <${cfg.METABASE_URL}/question/${cfg.QUESTION_ID}|Abrir lista completa no Metabase>`;
+  return message;
+}
 
-  // 7. Enviar pro webhook do Google Chat ==================================
-  const chatRes = UrlFetchApp.fetch(WEBHOOK_URL, {
+// ============================================================================
+// Aviso de falha no Chat
+// ============================================================================
+
+function notifyFailure_(e, failures) {
+  const webhook = PropertiesService.getScriptProperties().getProperty('WEBHOOK_URL');
+  if (!webhook) {
+    Logger.log('Sem WEBHOOK_URL, impossível avisar a falha no Chat.');
+    return;
+  }
+
+  const execUrl = `https://script.google.com/home/projects/${ScriptApp.getScriptId()}/executions`;
+  const detail = String(e && e.message ? e.message : e).slice(0, 400);
+  const streak = failures > 1 ? ` (${failures}ª falha seguida)` : '';
+
+  let text = `⚠️ *O alerta de pedidos travados falhou hoje${streak}*\n`;
+  text += `_Os pedidos travados de hoje NÃO foram verificados. Ausência de alerta não significa ausência de pedidos._\n\n`;
+  text += `*Erro:* \`${detail}\`\n`;
+  text += `*Provável causa:* ${hintFor_(e)}\n\n`;
+  text += `🔧 <${execUrl}|Ver execuções no Apps Script>`;
+
+  // Se o erro foi no próprio webhook, provavelmente esta tentativa também falha.
+  // Nesse caso sobra o e-mail automático de falha do Apps Script.
+  try {
+    postToChat_(webhook, text);
+  } catch (err) {
+    Logger.log(`Não foi possível avisar a falha no Chat: ${err.message}`);
+  }
+}
+
+function hintFor_(e) {
+  if (e && e.source === 'config') {
+    return 'faltam Script Properties no projeto (METABASE_URL, METABASE_API_KEY, WEBHOOK_URL, QUESTION_ID).';
+  }
+  if (e && e.source === 'chat') {
+    return 'o webhook do Google Chat recusou a mensagem. Verifique se o webhook ainda existe no espaço.';
+  }
+  const code = e && e.httpStatus;
+  if (code === 401) {
+    return 'API key inválida ou revogada. Gere uma nova em metabase-keygen.devgogroup.com e atualize METABASE_API_KEY.';
+  }
+  if (code === 403) {
+    return 'a API key perdeu acesso à question. Confira se ela está numa coleção legível pelo grupo das chaves do keygen (ex.: Ecommerce), e não na raiz ou em coleção pessoal.';
+  }
+  if (code === 404) {
+    return 'question não encontrada. Confira QUESTION_ID ou se o card foi arquivado/excluído.';
+  }
+  if (code >= 500) {
+    return 'Metabase instável ou a query estourou o tempo. Rode notifyPedidosTravados manualmente mais tarde.';
+  }
+  return 'erro inesperado. Veja o log da execução.';
+}
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+function getConfig_() {
+  const props = PropertiesService.getScriptProperties();
+  const cfg = {
+    METABASE_URL: (props.getProperty('METABASE_URL') || '').replace(/\/$/, ''),
+    API_KEY: props.getProperty('METABASE_API_KEY'),
+    WEBHOOK_URL: props.getProperty('WEBHOOK_URL'),
+    QUESTION_ID: props.getProperty('QUESTION_ID')
+  };
+  const missing = Object.keys(cfg).filter(k => !cfg[k]);
+  if (missing.length) {
+    throw alertError_('config', null, `Faltam Script Properties: ${missing.join(', ')}`);
+  }
+  return cfg;
+}
+
+function postToChat_(webhookUrl, text) {
+  const res = UrlFetchApp.fetch(webhookUrl, {
     method: 'post',
     contentType: 'application/json',
-    payload: JSON.stringify({ text: message }),
+    payload: JSON.stringify({ text: text }),
     muteHttpExceptions: true
   });
+  const code = res.getResponseCode();
+  if (code !== 200) {
+    throw alertError_('chat', code,
+      `Webhook do Chat falhou (${code}): ${res.getContentText().slice(0, 300)}`);
+  }
+}
 
-  Logger.log(`Mensagem enviada ao Chat. Status HTTP: ${chatRes.getResponseCode()}`);
+function alertError_(source, httpStatus, message) {
+  const err = new Error(message);
+  err.source = source;
+  err.httpStatus = httpStatus;
+  return err;
+}
+
+/**
+ * Normaliza nome de coluna: minúsculas, sem acentos, sem caracteres especiais.
+ * "MOTIVO DE TRAVAMENTO" → "motivodetravamento"
+ */
+function normalize_(s) {
+  return String(s).toLowerCase()
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]/g, '');
+}
+
+function getField_(row, ...candidates) {
+  const keys = Object.keys(row).map(k => ({ orig: k, norm: normalize_(k) }));
+  for (const c of candidates) {
+    const match = keys.find(({ norm }) => norm === normalize_(c));
+    if (match && row[match.orig] != null) return row[match.orig];
+  }
+  return null;
+}
+
+function parseDate_(v) {
+  if (!v) return null;
+  const d = new Date(v);
+  return isNaN(d.getTime()) ? null : d;
+}
+
+function bucketOf_(h) {
+  if (h == null) return 'unknown';
+  if (h >= 48) return 'critical';
+  if (h >= 24) return 'high';
+  if (h >= 12) return 'medium';
+  return 'low';
+}
+
+function formatDate_(d) {
+  return d ? Utilities.formatDate(d, CONFIG.TZ, "dd/MM 'às' HH:mm") : '';
+}
+
+// ============================================================================
+// Setup e testes (rodar manualmente pelo editor)
+// ============================================================================
+
+/**
+ * Recria o acionador diário. Apaga os existentes antes, para não duplicar.
+ * O fuso é fixado no próprio acionador, então não depende da configuração
+ * de fuso do projeto.
+ */
+function setupTrigger() {
+  ScriptApp.getProjectTriggers()
+    .filter(t => t.getHandlerFunction() === CONFIG.TRIGGER_FUNCTION)
+    .forEach(t => ScriptApp.deleteTrigger(t));
+
+  ScriptApp.newTrigger(CONFIG.TRIGGER_FUNCTION)
+    .timeBased()
+    .everyDays(1)
+    .atHour(CONFIG.TRIGGER_HOUR)
+    .inTimezone(CONFIG.TZ)
+    .create();
+
+  const n = ScriptApp.getProjectTriggers()
+    .filter(t => t.getHandlerFunction() === CONFIG.TRIGGER_FUNCTION).length;
+  Logger.log(`Acionador criado: todo dia entre ${CONFIG.TRIGGER_HOUR}h e ${CONFIG.TRIGGER_HOUR + 1}h (${CONFIG.TZ}). Total ativo: ${n}.`);
+}
+
+/**
+ * Posta no Chat um aviso de falha simulado, sem alterar o contador.
+ * Use para validar que o aviso chega no espaço.
+ */
+function testarAvisoDeFalha() {
+  notifyFailure_(alertError_('metabase', 403,
+    'TESTE: Query falhou (403): Você não tem permissão para fazer isso.'), 1);
 }
